@@ -9,6 +9,7 @@ import {
   mainRequest, parseMain, valueRequest, parseValue, needsIrreversibleCheck, irreversibleRequest,
   parseNoul, fieldOf, recentActions, isSecret, maskFor, secretsOf, InvalidAnswer, TEXT_INSTRUCTIONS, CONFIRM_INSTRUCTIONS,
 } from './policy.mjs';
+import { Ledger, stateId } from './ledger.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 const num = (v, d) => (v == null || v === '' || !Number.isFinite(+v)) ? d : +v;
@@ -32,6 +33,36 @@ class HttpError extends Error {
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Injected into the browser page to track SPA route changes
+const SPA_TRACKER_SCRIPT = `
+  await page.evaluate(() => {
+    if (window.__spaTrackerInstalled) return;
+    window.__spaTrackerInstalled = true;
+    window.__spaRoutes = [];
+    const record = (url) => {
+      try {
+        const u = new URL(url, location.origin);
+        const key = u.origin + u.pathname;
+        if (!window.__spaRoutes.some(r => r.key === key)) {
+          window.__spaRoutes.push({ key, url: u.href, ts: Date.now() });
+        }
+      } catch {}
+    };
+    const origPush = history.pushState;
+    const origReplace = history.replaceState;
+    history.pushState = function(...args) {
+      origPush.apply(this, args);
+      if (args[2]) record(args[2]);
+    };
+    history.replaceState = function(...args) {
+      origReplace.apply(this, args);
+      if (args[2]) record(args[2]);
+    };
+    window.addEventListener('popstate', () => record(location.href));
+    window.addEventListener('hashchange', (e) => record(e.newURL || location.href));
+  });
+`;
 
 // ── Upstream calls ──────────────────────────────────────────────────
 async function post(url, body, key, who, ms) {
@@ -104,11 +135,33 @@ async function observe(t) {
   t.obs = r;
   t.page = { url: r.url, title: r.title };
   t.site ??= siteOf(r.url);
+  // Record state in the exploration ledger
+  if (t.ledger) {
+    const sid = t.ledger.recordState(r);
+    t.currentStateId = sid;
+    // Record route
+    t.ledger.recordRoute(r.url, t.lastUrl || null);
+    // Detect forms from fill actions
+    const fillActions = (r.actions || []).filter(a => a.kind === 'fill');
+    if (fillActions.length > 0 && sid) {
+      t.ledger.recordForm(sid, r.url, fillActions);
+    }
+    t.lastUrl = r.url;
+    // Collect SPA-discovered routes from the in-page tracker
+    try {
+      const spa = await browser('/run', { code: 'return await page.evaluate(() => { const r = window.__spaRoutes || []; window.__spaRoutes = []; return r; })', timeout_ms: 3000 });
+      if (spa.ok && Array.isArray(spa.result)) {
+        for (const route of spa.result) {
+          if (route.url) t.ledger.recordRoute(route.url, 'spa');
+        }
+      }
+    } catch { /* SPA collection is best-effort */ }
+  }
   return r;
 }
 
 async function choose(t) {
-  const req = mainRequest(t.obs, t.goal, t.history, S1_MODEL, secretsOf(t.values));
+  const req = mainRequest(t.obs, t.goal, t.history, S1_MODEL, secretsOf(t.values), t.ledger);
   const { r, ms } = await model(t, req.body);
   t.stats.decisions++;
   const rec = { n: t.stats.decisions, operation: null, target: null, latency_ms: ms, usage: r.usage || {} };
@@ -175,9 +228,19 @@ async function loop(t, deadline, steps) {
       const before = d.obs.marker;
       await observe(t);
       if (t.obs.marker !== before) continue;
-      return d.operation === 'DONE'
-        ? stop(t, 'done', 'decision model chose DONE; verify the final page', false)
-        : stop(t, 'blocked', 'decision model chose BLOCKED: no supported operation can progress', true);
+      if (d.operation === 'DONE') {
+        // Enhanced completion: check frontier before accepting DONE
+        if (t.ledger) {
+          const pending = [...t.ledger.frontier.values()].filter(f => f.status === 'pending');
+          if (pending.length > 0) {
+            // Model said DONE but frontier has unexplored routes — override to continue
+            return stop(t, 'blocked',
+              `decision model chose DONE but ${pending.length} frontier route(s) remain unexplored; continue to explore them`, true);
+          }
+        }
+        return stop(t, 'done', 'decision model chose DONE; verify the final page', false);
+      }
+      return stop(t, 'blocked', 'decision model chose BLOCKED: no supported operation can progress', true);
     }
 
     const a = d.action;
@@ -214,7 +277,11 @@ async function loop(t, deadline, steps) {
       if (e.upstream && e.upstream < 500) throw e;
       res = { ok: false, unknown: true, error: e.message };
     }
-    if (res.stale) { await observe(t); continue; }
+    if (res.stale) {
+      if (t.ledger) t.ledger.recordAction(d.operation, d.element, t.currentStateId, 'stale', { detail: 'observation expired' });
+      await observe(t);
+      continue;
+    }
     t.confirmed = null;
     const secret = text != null && (isSecret(a.label) || secrets.has(text));
     const step = {
@@ -228,6 +295,7 @@ async function loop(t, deadline, steps) {
       t.history.push(h);
       steps.push(step);
       t.stats.actions++;
+      if (t.ledger) t.ledger.recordAction(d.operation, d.element, t.currentStateId, 'unknown', { ms: step.ms, detail: res.error });
       t.obs = null;
       return stop(t, 'blocked', 'outcome unknown — inspect the page, then continue', true);
     }
@@ -239,6 +307,34 @@ async function loop(t, deadline, steps) {
     t.obs = null;
     await observe(t);
     h.page_changed = step.changed = t.obs.fingerprint !== fp;
+
+    // Postcondition verification and retry tracking
+    if (t.ledger) {
+      let outcome = 'pending';
+      let detail = null;
+
+      if (a.kind === 'click' && a.role === 'link' && a.href) {
+        outcome = h.page_changed ? 'success' : 'failed';
+        if (!h.page_changed) detail = 'navigation click did not change page';
+      } else if (a.kind === 'fill' && text != null) {
+        outcome = 'success';
+      } else if (h.page_changed) {
+        outcome = 'success';
+      }
+
+      t.ledger.recordAction(d.operation, d.element, t.currentStateId, outcome, {
+        ms: step.ms, pageChanged: h.page_changed, detail,
+      });
+      if (t.ledger.subgoal) t.ledger.subgoal.actionsInSubgoal++;
+
+      // Bounded retry: if same target fails 3+ times at same state, skip it
+      const retryInfo = t.ledger.getRetryInfo(t.currentStateId, d.element);
+      if (retryInfo.attempts >= 3 && outcome === 'failed') {
+        t.ledger.recordAction(d.operation, d.element, t.currentStateId, 'blocked', {
+          detail: `abandoned after ${retryInfo.attempts} attempts`,
+        });
+      }
+    }
 
     const last = t.history.slice(-3);
     if (last.length === 3 && last.every(x => x.page_changed === false && x.kind !== 'wait'))
@@ -256,6 +352,11 @@ function response(t, steps) {
   if ((t.status === 'done' || t.status === 'blocked') && t.obs)
     out.final = { url: t.obs.url, title: t.obs.title, text: (t.obs.text || '').slice(0, 2000) };
   out.stats = { ...t.stats };
+  // Include exploration progress from the ledger
+  if (t.ledger) {
+    out.exploration = t.ledger.completionStatus();
+    if (t.ledger.subgoal) out.subgoal = { text: t.ledger.subgoal.text, actions: t.ledger.subgoal.actionsInSubgoal };
+  }
   return out;
 }
 
@@ -322,8 +423,11 @@ async function startTask(body) {
     max_decisions: intField(body, 'max_decisions', 120, 2000),
     status: 'running', reason: undefined, resumable: undefined, pending: null, busy: true,
     obs: null, page: null, site: null, decision: null, history: [], decisions: [], textCache: null, confirmed: null,
+    currentStateId: null, lastUrl: null,
     stats: { actions: 0, decisions: 0, model_calls: 0, elapsed_ms: 0, model_ms: 0, input_tokens: 0, output_tokens: 0 },
   };
+  t.ledger = new Ledger(t.id, goal.trim(), body.role || null);
+  if (body.subgoal) t.ledger.setSubgoal(body.subgoal, body.expected_outcome || null);
   const maxMs = intField(body, 'max_ms', 60000, 600000);
   current = t;
   tasks.set(t.id, t);
@@ -341,6 +445,10 @@ async function startTask(body) {
       return response(t, []);
     }
   }
+  // Install SPA route tracker before exploration begins
+  try {
+    await post(`${BROWSER_URL}/run`, { code: SPA_TRACKER_SCRIPT, timeout_ms: 5000 }, BROWSER_KEY, 'Browser', 10000);
+  } catch { /* non-fatal — SPA tracking is best-effort */ }
   return runCall(t, maxMs);
 }
 
@@ -382,6 +490,10 @@ async function continueTask(body) {
     throw new HttpError(400, 'confirm must be a boolean');
   }
   Object.assign(t.values, values);
+  // Update subgoal if provided
+  if (body.subgoal !== undefined && t.ledger) {
+    t.ledger.setSubgoal(body.subgoal || null, body.expected_outcome || null);
+  }
   if (answer) {
     if (!answer()) { t.obs = null; return response(t, []); }
   } else {
@@ -403,13 +515,15 @@ function stopTask(body) {
 
 function trace(id) {
   const t = getTask(id);
-  return {
+  const out = {
     ok: true, task: t.id, goal: t.goal, status: t.status, ...(t.reason ? { reason: t.reason } : {}),
     decisions: t.decisions,
     actions: t.history.map((h, i) => ({ n: i + 1, action: h.action, kind: h.kind,
       text: h.text == null ? null : h.secret ? '***' : maskFor(h.field, h.text, secretsOf(t.values)), page_changed: h.page_changed })),
     stats: response(t, []).stats,
   };
+  if (t.ledger) out.exploration = t.ledger.toJSON();
+  return out;
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────

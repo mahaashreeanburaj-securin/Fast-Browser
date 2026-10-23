@@ -8,6 +8,7 @@ Set every requested filter/control; a matching result alone does not prove a req
 Do not toggle a checkbox, switch, or radio already in the requested state.
 Submit populated search fields before opening a result; a populated field alone is not an applied search.
 WAIT only when the needed control is absent/disabled, or submitted results are still loading.
+For spinbutton (numeric) fields, use TYPE_TEXT to enter a value; CLICK only focuses the field.
 If Search/Submit is visible and the required fields are ready, CLICK it immediately.
 Recent WAIT actions are not evidence of loading. Prefer a useful visible control over WAIT.
 DONE requires visible evidence that ALL requirements are satisfied. If asked to open a result,
@@ -76,6 +77,7 @@ export function actionSpace(actions, secrets) {
     }
     const el = elements[+index - 1];
     if (a.kind === 'fill') el.label = a.label;
+    if (op === 'TYPE_TEXT' && el.value === '***') continue;
     if (!el.operations.includes(op)) el.operations.push(op);
     let target = index;
     if (a.kind === 'select') {
@@ -93,6 +95,7 @@ export function describe(index, a, secrets) {
   let s = `[${index}] ${a.role || a.kind} ${JSON.stringify(oneLine(a.label))}`;
   const v = maskFor(name, a.kind === 'select' ? str(a.current_value) : str(a.value), secrets);
   if (v) s += ` ${a.kind === 'select' ? 'current' : 'value'}=${JSON.stringify(oneLine(v).slice(0, 200))}`;
+  if (v === '***') s += ' (secret — already filled, do not retype)';
   for (const k of ['checked', 'selected', 'expanded']) if (a[k] != null) s += ` ${k}=${a[k]}`;
   return oneLine(s);
 }
@@ -104,29 +107,64 @@ export const recentActions = (history, secrets) => history.slice(-10).map(h => (
 
 const pageState = obs => ({ url: obs.url, title: obs.title, text: obs.text || '' });
 
-export function mainRequest(obs, goal, history, model, secrets) {
+export function mainRequest(obs, goal, history, model, secrets, ledger) {
   const space = actionSpace(obs.actions, secrets);
   const operations = {};
   for (const op of Object.keys(space.targets)) operations[op] = OP_LABELS[op];
   for (const [k, a] of Object.entries(space.controls)) operations[k] = oneLine(a.label);
   operations.DONE = 'Every requirement is visibly satisfied.';
   operations.BLOCKED = 'No supported operation can progress.';
+
+  const goalText = ledger ? buildGoalText(goal, ledger) : goal;
+
   const questions = {
-    operation: { type: 'choice', instructions: `Goal: ${goal}\n\n${NEXT_ACTION}`, criteria: operations },
+    operation: { type: 'choice', instructions: `Goal: ${goalText}\n\n${NEXT_ACTION}`, criteria: operations },
   };
   for (const [op, cands] of Object.entries(space.targets)) {
     const criteria = {};
     for (const [i, a] of Object.entries(cands)) criteria[i] = describe(i, a, secrets);
     questions[`${op.toLowerCase()}_target`] = {
-      type: 'choice', instructions: `Goal: ${goal}\nOperation: ${op}\n\n${NEXT_ACTION}\n\n${TARGET}`, criteria,
+      type: 'choice', instructions: `Goal: ${goalText}\nOperation: ${op}\n\n${NEXT_ACTION}\n\n${TARGET}`, criteria,
     };
   }
-  const body = {
-    model,
-    state: { page: pageState(obs), elements: space.elements, recent_actions: recentActions(history, secrets) },
-    questions,
-  };
+
+  const state = { page: pageState(obs), elements: space.elements };
+  if (ledger) {
+    const ctx = ledger.contextSummary(10);
+    state.recent_actions = ctx.recentActions;
+    state.exploration = {
+      statesExplored: ctx.statesExplored,
+      routesDiscovered: ctx.routesDiscovered,
+      pendingFrontier: ctx.pendingFrontier,
+      pendingRoutes: ctx.pendingRoutes,
+    };
+    if (ctx.recentFailures) state.recentFailures = ctx.recentFailures;
+  } else {
+    state.recent_actions = recentActions(history, secrets);
+  }
+
+  const body = { model, state, questions };
   return { body, space, operations, secrets };
+}
+
+function buildGoalText(goal, ledger) {
+  const parts = [goal];
+  if (ledger.subgoal?.text) {
+    parts.push(`\nCurrent subgoal: ${ledger.subgoal.text}`);
+    if (ledger.subgoal.expectedOutcome) {
+      parts.push(`Expected outcome: ${ledger.subgoal.expectedOutcome}`);
+    }
+  }
+  const pending = [...ledger.frontier.values()].filter(f => f.status === 'pending');
+  if (pending.length > 0) {
+    parts.push(`\n${pending.length} unexplored route(s) remaining.`);
+  }
+  const fails = ledger.actions.filter(a => a.outcome === 'failed' || a.outcome === 'blocked').slice(-3);
+  if (fails.length > 0) {
+    const failSummary = fails.map(f => `${f.op} "${f.target}" (attempt #${f.attemptN})`).join('; ');
+    parts.push(`Recent failures: ${failSummary} — try a different approach.`);
+  }
+  return parts.join('\n');
 }
 
 export class InvalidAnswer extends Error {}
